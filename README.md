@@ -1,6 +1,6 @@
 # Medical Reference Interval Analysis Skill
 
-A comprehensive tool for calculating and validating medical reference intervals (RIs) according to CLSI C28-A3 guidelines.
+An agent skill that constructs indirect confidence intervals based on real-world data and five algorithms.
 
 ## Features
 - Automated Data Loading
@@ -9,3 +9,16 @@ A comprehensive tool for calculating and validating medical reference intervals 
 - Intelligent Partitioning (Gender/Age)
 - Reference Interval Calculation
 - Visualization
+
+ # All contributing authors
+Yunfeng Wu, Tingting Huang, Shuang Lou, YunJun Mo, Fan Yu, Shichang Zhang, Haihong He
+
+ # These authors contributed equally.
+Shichang Zhang, Email address: zsc78@yeah.net
+Haihong He, Email address: herotod83@smu.edu.cn
+
+# Affiliations
+Center of clinical laboratory, Shenzhen Hospital, Southern Medical University, Shenzhen, Guangdong, China
+
+# Address
+No.13 Xinhu Road, Shenzhen, Guangdong, 518102, China，
