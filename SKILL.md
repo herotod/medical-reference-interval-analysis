@@ -1,6 +1,6 @@
 ---
 name: medical-reference-interval-analysis
-description: A comprehensive tool for calculating and validating medical reference intervals (RIs) according to CLSI C28-A3 guidelines. It supports automatic data cleaning, outlier detection, gender/age partitioning (Harris-Boyd, Cohen's d), and robust statistical analysis.
+description: A comprehensive tool for calculating and validating medical reference intervals (RIs). It supports automatic data cleaning, outlier detection, gender/age partitioning, and robust statistical analysis.
 version: 1.0.0
 usage:
   - "Analyze reference intervals for a dataset: `python analysis.py`"
