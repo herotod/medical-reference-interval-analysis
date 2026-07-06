@@ -1,6 +1,6 @@
 ---
 name: medical-reference-interval-analysis
-description: A comprehensive tool for calculating and validating medical reference intervals (RIs). It supports automatic data cleaning, outlier detection, gender/age partitioning, and robust statistical analysis.
+description: An agent skill that constructs indirect reference intervals based on real-world data and five algorithms. 
 version: 1.0.0
 usage:
   - "Analyze reference intervals for a dataset: `python analysis.py`"
