@@ -1,6 +1,6 @@
 # Medical Reference Interval Analysis Skill
 
-An agent skill that constructs indirect confidence intervals based on real-world data and five algorithms.
+An agent skill that constructs indirect reference intervals based on real-world data and five algorithms.
 
 ## Features
 - Automated Data Loading
