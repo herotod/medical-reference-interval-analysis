@@ -23,21 +23,50 @@ import math
 warnings.filterwarnings('ignore')
 
 # =============================================================================
-# 1. 配置参数
+# 1. 配置参数（默认值见 CONFIG，可由命令行覆盖，见文件末尾 argparse）
 # =============================================================================
 
-# 设置输出路径
-output_base_path = os.path.join(".", "results_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
-os.makedirs(output_base_path, exist_ok=True)
+CONFIG = {
+    "train_ratio": 0.8,            # 训练集比例（按测定时间顺序切分，前 80% 训练、后 20% 验证）
+    "min_samples": 120,            # 年龄分组：单个年龄组的最小样本量
+    "cohen_d_threshold": 0.2,      # 年龄分组：相邻年龄组 Cohen's d 合并阈值
+    "bootstrap_iterations": 1000,  # 参考区间 bootstrap 次数
+    "min_group_for_ri": 20,        # 单个性别-年龄组计算参考区间的最低样本量
+    "random_seed": 42,             # 随机种子（GMM / IsolationForest / bootstrap 复现）
+    "result_lower_bound": None,    # 结果值下限过滤；None 表示沿用 result > 0 的默认口径
+}
 
-# 原始数据路径
+# 运行期路径（由 configure() 赋值）
 source_path = "."
+output_base_path = None
+train_path = None
+val_path = None
 
-# 训练集和验证集路径
-train_path = os.path.join(output_base_path, "train")
-val_path = os.path.join(output_base_path, "val")
-os.makedirs(train_path, exist_ok=True)
-os.makedirs(val_path, exist_ok=True)
+
+def configure(input_dir=".", output_dir=None, **overrides):
+    """设置输入/输出目录与分析参数；目录不存在时自动创建。
+
+    脚本读写用的是模块级全局变量，因此这里必须显式声明 global 后再赋值，
+    否则函数内的赋值只会产生局部变量，main() 仍会读到旧路径。
+    """
+    global source_path, output_base_path, train_path, val_path
+    source_path = os.path.abspath(input_dir)
+    if output_dir:
+        output_base_path = os.path.abspath(output_dir)
+    else:
+        output_base_path = os.path.join(
+            os.getcwd(), "results_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
+    train_path = os.path.join(output_base_path, "train")
+    val_path = os.path.join(output_base_path, "val")
+    os.makedirs(train_path, exist_ok=True)
+    os.makedirs(val_path, exist_ok=True)
+    for key, value in overrides.items():
+        if value is None:
+            continue
+        if key not in CONFIG:
+            raise KeyError(f"未知配置项: {key}")
+        CONFIG[key] = value
+    return output_base_path
 
 # =============================================================================
 # 2. 数据预处理和分割函数
@@ -64,36 +93,32 @@ def preprocess_file(file_path):
         # 读取文件
         df = pd.read_excel(file_path)
         
-        # 获取项目名称（从文件名获取）
+        # 获取项目名称（从文件名获取；用 splitext 而不是 split('.')，避免文件名自带点号时错位）
         filename = os.path.basename(file_path)
-        project_name = filename.split('.')[0]
+        project_name = os.path.splitext(filename)[0]
         
-        # 预处理 - 使用中英文列名
-        # 首先检查列名是否存在
-        required_columns = []
-        for col in ['结果', 'result', '测定时间', 'date', '性别', 'gender', '年龄', 'age']:
-            if col in df.columns:
-                if '结果' in df.columns or 'result' in df.columns:
-                    result_col = '结果' if '结果' in df.columns else 'result'
-                if '测定时间' in df.columns or 'date' in df.columns:
-                    date_col = '测定时间' if '測定時間' in df.columns else 'date'
-                if '性别' in df.columns or 'gender' in df.columns:
-                    gender_col = '性别' if '性别' in df.columns else 'gender'
-                if '年龄' in df.columns or 'age' in df.columns:
-                    age_col = '年龄' if '年龄' in df.columns else 'age'
+        # 预处理 - 使用中英文列名（中文优先，缺失时回退英文）
+        result_col = '结果' if '结果' in df.columns else ('result' if 'result' in df.columns else None)
+        date_col = '测定时间' if '测定时间' in df.columns else ('date' if 'date' in df.columns else None)
+        gender_col = '性别' if '性别' in df.columns else ('gender' if 'gender' in df.columns else None)
+        age_col = '年龄' if '年龄' in df.columns else ('age' if 'age' in df.columns else None)
+        
+        missing_cols = [name for name, col in [
+            ('结果/result', result_col), ('测定时间/date', date_col),
+            ('性别/gender', gender_col), ('年龄/age', age_col)
+        ] if col is None]
+        if missing_cols:
+            raise ValueError(f"文件缺少必需列: {', '.join(missing_cols)}；实际列名为 {list(df.columns)}")
         
         # 创建新的DataFrame
         new_df = df[[result_col, date_col, gender_col, age_col]].copy()
         new_df.columns = ['result', 'date', 'gender', 'age']
         
-        # 处理日期列
-        try:
-            # 尝试多种日期格式
+        # 处理日期列（Excel 序列号按 1899-12-30 起算，避免被误解析为 1970 年附近）
+        if pd.api.types.is_numeric_dtype(new_df['date']) and new_df['date'].notna().any():
+            new_df['date'] = pd.Timestamp('1899-12-30') + pd.to_timedelta(new_df['date'], unit='D')
+        else:
             new_df['date'] = pd.to_datetime(new_df['date'], errors='coerce')
-        except:
-            # 如果转换失败，尝试Excel日期格式
-            new_df['date'] = new_df['date'].apply(lambda x: pd.Timestamp('1899-12-30') + pd.Timedelta(days=x) 
-                                                if isinstance(x, (int, float)) else pd.NaT)
         
         # 处理性别列
         def convert_gender(x):
@@ -121,7 +146,12 @@ def preprocess_file(file_path):
         
         # 处理结果列
         new_df['result'] = pd.to_numeric(new_df['result'], errors='coerce')
-        new_df = new_df[new_df['result'] > 0]
+        lower_bound = CONFIG.get('result_lower_bound')
+        if lower_bound is None:
+            # 默认口径：剔除 <=0 的结果（适用于浓度类指标；若指标本身可为 0 或负值，请用 --result-lower-bound 显式指定）
+            new_df = new_df[new_df['result'] > 0]
+        else:
+            new_df = new_df[new_df['result'] >= lower_bound]
         new_df.dropna(subset=['result'], inplace=True)
         
         # 按日期升序排序
@@ -299,82 +329,97 @@ def calculate_cohens_d_age(group1, group2):
     return cohen_d
 
 def auto_age_grouping_improved(data, min_samples=120, cohen_d_threshold=0.2, max_iterations=10):
-    """改进的自动年龄分组算法"""
-    if len(data) == 0:
+    """自动年龄分层（与 Wu et al. Clin Biochem 2026, §2.4 一致）
+
+    算法（论文原文口径，逐字对应）：
+      1. 以**单岁**为初始组，仅用训练集，男女分别进行；
+      2. 每轮顺序遍历所有相邻组对 (i, i+1)：
+         - 任一组 n < min_samples → 无条件合并（样本量准则）；
+         - 两组均 n ≥ min_samples → 计算 Cohen's d，|d| ≤ cohen_d_threshold 则合并（效应量准则）；
+      3. **合并后就地继续**：新合成的组立即与下一组比较（论文的"顺序遍历"是
+         单趟凝聚，不是每轮只配一轮对，否则收敛要慢好几轮、还容易留下
+         由配对顺序导致的碎段）；
+      4. 一整趟遍历无任何合并（收敛）或达到 max_iterations 轮即停止；
+      5. 输出满足"每组 n ≥ min_samples、相邻组 |d| > 阈值"的离散年龄段。
+
+    论文默认参数：min_samples = 120、cohen_d_threshold = 0.2、max_iterations = 10。
+    注意：本算法从单岁起点做相邻合并，因此只有当单岁样本量能达到 min_samples
+    时才会真正形成年龄段；样本被摊到几十个单岁上去时（例如 1-89 岁、1000 例），
+    几乎所有单岁组都低于阈值，最终会合并成一整段——这是方法本身的限制，报告
+    里必须如实写"按最小样本量与效应量合并，未触发年龄分割"。
+    """
+    if len(data) == 0 or 'age' not in data.columns:
         return []
-    
-    # 确保年龄是整数
-    data['age_int'] = data['age'].astype(int)
+
+    # 年龄取整：先四舍五入再转整型（astype(int) 是截断，会把 17.9 岁算成 17 岁）；
+    # NaN 年龄先剔除，否则 astype(int) 会抛 IntCastingNaNError 并中断整条流程。
+    age_value = pd.to_numeric(data['age'], errors='coerce')
+    data = data.assign(age_int=age_value.round())
+    data = data[data['age_int'].notna()].copy()
+    data['age_int'] = data['age_int'].astype(int)
+
+    if data.empty:
+        return []
+
     min_age = int(data['age_int'].min())
     max_age = int(data['age_int'].max())
-    
+
     # 创建初始的单岁年龄组
-    age_ranges = []
-    for age in range(min_age, max_age + 1):
-        age_ranges.append((age, age))
-    
     groups = []
-    for low, high in age_ranges:
-        group_df = data[(data['age_int'] >= low) & (data['age_int'] <= high)]
+    for low in range(min_age, max_age + 1):
+        group_df = data[data['age_int'] == low]
         groups.append({
-            'range': (low, high),
+            'range': (low, low),
             'data': group_df['result'].values,
             'size': len(group_df)
         })
-    
+
     iteration = 0
-    changed = True
-    
-    while changed and iteration < max_iterations:
+    work = groups          # 就地凝聚的工作副本
+
+    while iteration < max_iterations:
         changed = False
+
+        # 单趟顺序遍历：合并后就地继续比较，不跳过下一组
         i = 0
-        new_groups = []
-        
-        while i < len(groups):
-            if i == len(groups) - 1:
-                new_groups.append(groups[i])
-                i += 1
+        while i < len(work) - 1:
+            cur, nxt = work[i], work[i + 1]
+
+            if cur['size'] < min_samples or nxt['size'] < min_samples:
+                merge = True      # 样本量准则：无条件合并
             else:
-                current_group = groups[i]
-                next_group = groups[i+1]
-                
-                if current_group['size'] < min_samples or next_group['size'] < min_samples:
-                    # 合并小样本组
-                    new_low = min(current_group['range'][0], next_group['range'][0])
-                    new_high = max(current_group['range'][1], next_group['range'][1])
-                    merged_data = np.concatenate([current_group['data'], next_group['data']])
-                    new_groups.append({
-                        'range': (new_low, new_high),
-                        'data': merged_data,
-                        'size': len(merged_data)
-                    })
-                    changed = True
-                    i += 2
-                else:
-                    # 计算Cohen's d
-                    cohen_d = calculate_cohens_d_age(current_group['data'], next_group['data'])
-                    
-                    if abs(cohen_d) <= cohen_d_threshold:
-                        # 效应量小，合并组
-                        new_low = min(current_group['range'][0], next_group['range'][0])
-                        new_high = max(current_group['range'][1], next_group['range'][1])
-                        merged_data = np.concatenate([current_group['data'], next_group['data']])
-                        new_groups.append({
-                            'range': (new_low, new_high),
-                            'data': merged_data,
-                            'size': len(merged_data)
-                        })
-                        changed = True
-                        i += 2
-                    else:
-                        # 效应量大，保持分开
-                        new_groups.append(current_group)
-                        i += 1
-        
-        groups = new_groups
+                cohen_d = calculate_cohens_d_age(cur['data'], nxt['data'])
+                merge = (not np.isnan(cohen_d)) and abs(cohen_d) <= cohen_d_threshold
+
+            if merge:
+                merged_data = np.concatenate([cur['data'], nxt['data']])
+                work[i] = {
+                    'range': (cur['range'][0], nxt['range'][1]),
+                    'data': merged_data,
+                    'size': len(merged_data)
+                }
+                del work[i + 1]
+                changed = True
+            else:
+                i += 1
+
+        # 末尾残组：不足 min_samples 时向前并，避免留下不可靠的一小段
+        while len(work) > 1 and work[-1]['size'] < min_samples:
+            last = work.pop()
+            prev = work[-1]
+            merged_data = np.concatenate([prev['data'], last['data']])
+            work[-1] = {
+                'range': (prev['range'][0], last['range'][1]),
+                'data': merged_data,
+                'size': len(merged_data)
+            }
+            changed = True
+
         iteration += 1
-    
-    final_ranges = [g['range'] for g in groups]
+        if not changed:
+            break
+
+    final_ranges = [g['range'] for g in work]
     return final_ranges
 
 # =============================================================================
@@ -392,8 +437,12 @@ def detect_outliers_tukey(data):
 
 def detect_outliers_gmm(data):
     """GMM方法检测异常值"""
+    if len(data) < 10:
+        return np.zeros(len(data), dtype=bool)
     data_reshaped = data.reshape(-1, 1)
-    gmm = GaussianMixture(n_components=2)
+    # 固定随机种子：GMM 默认随机初始化，不设种子时同一份数据两次运行会给出不同区间，
+    # 论文结果无法复现。
+    gmm = GaussianMixture(n_components=2, random_state=CONFIG.get('random_seed', 42))
     gmm.fit(data_reshaped)
     scores = gmm.score_samples(data_reshaped)
     threshold = np.percentile(scores, 1)
@@ -432,34 +481,50 @@ def boxcox_transform(data):
 
 def inverse_boxcox(transformed, lmbda, shift):
     """Box-Cox逆变换"""
-    if lmbda == 0:
+    # λ 用容差判断：MLE 优化得到的 λ 极少恰好等于 0，而是 ±1e-9 量级的数，
+    # 此时 (λx+1)**(1/λ) 会数值溢出，得到 inf 或 nan。
+    if abs(lmbda) < 1e-6:
         original = np.exp(transformed)
     else:
         original = (lmbda * transformed + 1) ** (1 / lmbda)
     
     return original - shift
 
-def bootstrap_reference_interval(data, n_bootstrap=1000, alpha=0.05):
-    """使用自举法计算参考区间"""
+def bootstrap_reference_interval(data, n_bootstrap=1000, alpha=0.05, seed=None):
+    """自举法估计 2.5th/97.5th 分位数及其 95% 置信区间
+
+    返回 6 元组：(下限, 上限, 下限 CI 低, 下限 CI 高, 上限 CI 低, 上限 CI 高)。
+    前两个是 bootstrap 重复抽样下分位数的中位数（限值的稳健点估计）；后四个是
+    该分位数估计的 95% 抽样区间（对应论文 Table 3 的 "(95% CI)" 括号列）。
+    两者不能混为一谈：论文正文把前者当限值、把后者当限值的置信区间报告。
+    """
     n = len(data)
     if n < 10:
-        return np.nan, np.nan
-    
+        return np.nan, np.nan, np.nan, np.nan, np.nan, np.nan
+
+    rng = np.random.default_rng(seed if seed is not None else CONFIG.get('random_seed', 42))
     lower_percentile = alpha * 100 / 2
     upper_percentile = (1 - alpha / 2) * 100
-    
+
     lower_bounds = []
     upper_bounds = []
-    
+
     for _ in range(n_bootstrap):
-        sample = np.random.choice(data, size=n, replace=True)
+        sample = rng.choice(data, size=n, replace=True)
         lower_bounds.append(np.percentile(sample, lower_percentile))
         upper_bounds.append(np.percentile(sample, upper_percentile))
-    
+
+    lower_bounds = np.asarray(lower_bounds)
+    upper_bounds = np.asarray(upper_bounds)
+
     lower_bound = np.median(lower_bounds)
     upper_bound = np.median(upper_bounds)
-    
-    return lower_bound, upper_bound
+
+    ci = alpha * 100 / 2, (1 - alpha / 2) * 100
+    lower_ci = np.percentile(lower_bounds, ci)
+    upper_ci = np.percentile(upper_bounds, ci)
+
+    return lower_bound, upper_bound, lower_ci[0], lower_ci[1], upper_ci[0], upper_ci[1]
 
 def calculate_brs(ref1_lower, ref1_upper, ref2_lower, ref2_upper):
     """计算BR值（Bias Ratio）"""
@@ -494,71 +559,91 @@ def check_age_in_range(age_str, age):
     except:
         return False
 
-def calculate_percentage_for_row(row, val_data_folder):
-    """为参考区间表中的每一行计算百分比"""
+def build_project_file_map(folder):
+    """建立 project 名 -> 实际文件路径 的映射。
+
+    参考区间表中的 Project 来自文件名（去掉扩展名），而拆分出的验证文件名
+    保留原文件名。文件名自带点号（如 ALT.2024.xlsx）时，f"{project}.xlsx"
+    会拼错路径并静默跳过整组验证，因此这里按目录实际文件名建映射。
+    """
+    file_map = {}
+    for path in glob.glob(os.path.join(folder, "*.xlsx")):
+        file_map[os.path.splitext(os.path.basename(path))[0]] = path
+    return file_map
+
+def load_validation_frame(file_path, cache=None):
+    """读取并预处理验证集文件；cache 用于避免同一文件被反复读上千次。
+
+    原实现对参考区间表的每一行都重新 read_excel 一次（行数 = 分组 × 5 种方法，
+    大型项目可达数千行），几十个指标的队列会因此耗时数分钟到数十分钟。
+    """
+    if cache is not None and file_path in cache:
+        return cache[file_path]
+    
+    val_df = pd.read_excel(file_path)
+    required_columns = ['result', 'gender', 'age']
+    if not all(col in val_df.columns for col in required_columns):
+        raise ValueError(f"验证文件缺少必要列 {required_columns}: {file_path}")
+    
+    # 统一性别取值（验证集可能来自本方拆分（male/female），也可能是外部原始数据（男/女）
+    val_df['gender'] = val_df['gender'].apply(
+        lambda x: np.nan if pd.isna(x) else str(x).strip().lower())
+    val_df['gender'] = val_df['gender'].replace({'男': 'male', 'm': 'male', '女': 'female', 'f': 'female'})
+    
+    val_df['result'] = pd.to_numeric(val_df['result'], errors='coerce')
+    val_df['age_numeric'] = pd.to_numeric(val_df['age'], errors='coerce')
+    if val_df['age_numeric'].max() > 120:
+        val_df['age_value'] = val_df['age_numeric'].apply(excel_date_to_age)
+    else:
+        val_df['age_value'] = val_df['age_numeric']
+    
+    if cache is not None:
+        cache[file_path] = val_df
+    return val_df
+
+def calculate_percentage_for_row(row, val_data_folder, cache=None, file_map=None):
+    """为参考区间表中的每一行计算百分比（验证集覆盖率）"""
     project = row['Project']
     gender = row['Gender']
     age_group = row['Age Group']
-    method = row['Method']
     lower_limit = row['Lower Limit']
     upper_limit = row['Upper Limit']
     
     # 构建对应的验证数据文件路径
-    file_path = os.path.join(val_data_folder, f"{project}.xlsx")
+    if file_map and project in file_map:
+        file_path = file_map[project]
+    else:
+        file_path = os.path.join(val_data_folder, f"{project}.xlsx")
     
     if not os.path.exists(file_path):
         print(f"验证文件不存在: {file_path}")
         return None
     
     try:
-        # 读取验证数据文件
-        val_df = pd.read_excel(file_path)
+        val_df = load_validation_frame(file_path, cache)
         
-        # 检查必要的列是否存在
-        required_columns = ['result', 'gender', 'age']
-        if not all(col in val_df.columns for col in required_columns):
-            print(f"验证文件缺少必要列: {file_path}")
-            return None
-        
-        # 过滤数据：匹配性别
-        if gender.lower() == 'male':
-            gender_filter = (val_df['gender'].str.lower() == 'male') | (val_df['gender'] == '男')
-        elif gender.lower() == 'female':
-            gender_filter = (val_df['gender'].str.lower() == 'female') | (val_df['gender'] == '女')
+        gender_key = str(gender).strip().lower()
+        if gender_key in ('male', 'm', '男'):
+            gender_key = 'male'
+        elif gender_key in ('female', 'f', '女'):
+            gender_key = 'female'
         else:
             print(f"未知性别: {gender}")
             return None
         
-        # 应用性别过滤
-        filtered_df = val_df[gender_filter].copy()
-        
+        filtered_df = val_df[val_df['gender'] == gender_key]
         if len(filtered_df) == 0:
             print(f"没有找到匹配性别的数据: {project}, {gender}")
             return 0.0
         
-        # 处理年龄数据
-        filtered_df['age_numeric'] = pd.to_numeric(filtered_df['age'], errors='coerce')
-        
-        # 检查年龄是否为Excel日期格式
-        if filtered_df['age_numeric'].max() > 120:
-            filtered_df['age_value'] = filtered_df['age_numeric'].apply(excel_date_to_age)
-        else:
-            filtered_df['age_value'] = filtered_df['age_numeric']
-        
-        # 应用年龄范围过滤
         age_filter = filtered_df['age_value'].apply(lambda x: check_age_in_range(age_group, x))
         filtered_df = filtered_df[age_filter]
-        
         if len(filtered_df) == 0:
             print(f"没有找到匹配年龄范围的数据: {project}, {gender}, {age_group}")
             return 0.0
         
-        # 检查结果值是否在参考区间内
         result_in_range = (filtered_df['result'] >= lower_limit) & (filtered_df['result'] <= upper_limit)
-        
-        # 计算百分比
-        percentage = (result_in_range.sum() / len(filtered_df)) * 100 if len(filtered_df) > 0 else 0.0
-        
+        percentage = (result_in_range.sum() / len(filtered_df)) * 100
         return round(percentage, 2)
     
     except Exception as e:
@@ -570,6 +655,12 @@ def calculate_percentage_for_row(row, val_data_folder):
 # =============================================================================
 
 def main():
+    global output_base_path, train_path, val_path
+    # 直接 import 后调用 main()（未经过 configure）时，按默认参数补一次配置，
+    # 否则 train_path / val_path 仍为 None，7.1 写文件会直接失败。
+    if output_base_path is None:
+        configure(input_dir=source_path)
+
     print("=== 医学参考区间分析系统 ===")
     
     # 获取所有xlsx文件
@@ -599,7 +690,7 @@ def main():
             continue
         
         # 按4:1比例分割数据集（训练集占80%）
-        train_data, val_data = split_dataset_by_ratio(project_data, train_ratio=0.8)
+        train_data, val_data = split_dataset_by_ratio(project_data, train_ratio=CONFIG["train_ratio"])
         
         # 保存分割后的数据（保持原始文件名）
         original_filename = project_data['filename']
@@ -734,22 +825,16 @@ def main():
         # 动态计算子图布局 - 根据项目数量智能调整
         n_projects = len(display_projects)
         
-        # 计算合适的列数和行数
-        if n_projects <= 4:
-            n_cols = min(n_projects, 2)  # 1-4个项目时，最多2列
-            n_rows = math.ceil(n_projects / n_cols)
-        elif n_projects <= 9:
-            n_cols = 3  # 5-9个项目时，使用3列
-            n_rows = math.ceil(n_projects / n_cols)
-        else:
-            n_cols = 4  # 10个以上项目时，使用4列
-            n_rows = math.ceil(n_projects / n_cols)
-        
+        # 动态计算子图布局：SCI 风格统一单行横排，避免 3 个项目被折到第二行
+        n_projects = len(display_projects)
+        n_cols = n_projects
+        n_rows = 1
+
         print(f"KDE图布局: {n_rows}行 × {n_cols}列，共{n_projects}个项目")
-        
-        # 创建图形，根据行数调整高度
-        fig_height = 5 * n_rows
-        fig_width = 5 * n_cols
+
+        # 创建图形：单行横排，每个面板约 4.6 英寸宽
+        fig_height = 4.6
+        fig_width = 4.6 * n_cols
         fig = plt.figure(figsize=(fig_width, fig_height), dpi=600)
         sns.set_style("whitegrid")
         sns.set_palette("colorblind")
@@ -778,12 +863,12 @@ def main():
             plt.xlabel('Result', fontsize=11, fontweight='bold')
             plt.ylabel('Density', fontsize=11, fontweight='bold')
             plt.title(f"{project['project_name']}", fontsize=12, fontweight='bold', pad=10)
-            plt.legend(fontsize=9, frameon=True, fancybox=True, shadow=True)
+            plt.legend(fontsize=9, frameon=True, fancybox=False, shadow=False, framealpha=0.9, edgecolor='0.8')
             
-            # 在图表上方中央添加样本量信息
-            sample_text = f"Total: {total_count}\nMale: {male_count}\nFemale: {female_count}"
-            plt.text(0.5, 0.95, sample_text, transform=ax.transAxes, 
-                     fontsize=10, fontweight='bold', verticalalignment='top', horizontalalignment='center',
+            # 样本量信息放左下角：原来放在顶部中央会被右上角图例压住，数字还被截断
+            sample_text = f"n = {total_count:,}  (M {male_count:,} / F {female_count:,})"
+            plt.text(0.02, 0.03, sample_text, transform=ax.transAxes,
+                     fontsize=8, fontweight='bold', verticalalignment='bottom', horizontalalignment='left',
                      bbox=dict(boxstyle='round', facecolor='white', alpha=0.9, edgecolor='black'))
             
             # 在右下角添加统计信息
@@ -849,22 +934,16 @@ def main():
         # 动态计算子图布局（与KDE图相同）
         n_projects = len(display_projects)
         
-        # 计算合适的列数和行数
-        if n_projects <= 4:
-            n_cols = min(n_projects, 2)  # 1-4个项目时，最多2列
-            n_rows = math.ceil(n_projects / n_cols)
-        elif n_projects <= 9:
-            n_cols = 3  # 5-9个项目时，使用3列
-            n_rows = math.ceil(n_projects / n_cols)
-        else:
-            n_cols = 4  # 10个以上项目时，使用4列
-            n_rows = math.ceil(n_projects / n_cols)
-        
+        # 动态计算子图布局：SCI 风格统一单行横排
+        n_projects = len(display_projects)
+        n_cols = n_projects
+        n_rows = 1
+
         print(f"GAM图布局: {n_rows}行 × {n_cols}列，共{n_projects}个项目")
-        
-        # 创建图形，根据行数调整高度
-        fig_height = 5 * n_rows
-        fig_width = 5 * n_cols
+
+        # 创建图形：单行横排
+        fig_height = 4.6
+        fig_width = 4.6 * n_cols
         fig = plt.figure(figsize=(fig_width, fig_height), dpi=600)
         sns.set_style("whitegrid")
         
@@ -879,43 +958,78 @@ def main():
             female_count = len(gam_data[gam_data['gender']=='female'])
             
             # 绘制原始数据点
-            male_points = gam_data[gam_data['gender']=='male']
-            female_points = gam_data[gam_data['gender']=='female']
-            
+            # 样本量上万时逐点绘制会糊成一块色板（16 万点即如此），失去可读性：
+            # 超过 20000 点时按性别随机抽样至 8000 点绘制，并缩小点径。
+            male_points = gam_data[gam_data['gender'] == 'male']
+            female_points = gam_data[gam_data['gender'] == 'female']
+            max_plot_points = 8000
+            point_size = 15 if len(gam_data) <= 20000 else 6
+            point_alpha = 0.1 if len(gam_data) <= 20000 else 0.25
+            rng = np.random.RandomState(CONFIG['random_seed'])
+
+            if len(male_points) > max_plot_points:
+                male_points = male_points.sample(n=max_plot_points, random_state=rng)
+            if len(female_points) > max_plot_points:
+                female_points = female_points.sample(n=max_plot_points, random_state=rng)
+
             if len(male_points) > 0:
-                plt.scatter(male_points['age'], male_points['result'], 
-                           alpha=0.1, color='blue', label='Male data', s=15)
-            
+                plt.scatter(male_points['age'], male_points['result'],
+                            alpha=point_alpha, color='blue', label='Male data' + (' (subsampled)' if male_count > max_plot_points else ''), s=point_size)
+
             if len(female_points) > 0:
-                plt.scatter(female_points['age'], female_points['result'], 
-                           alpha=0.1, color='red', label='Female data', s=15)
+                plt.scatter(female_points['age'], female_points['result'],
+                            alpha=point_alpha, color='red', label='Female data' + (' (subsampled)' if female_count > max_plot_points else ''), s=point_size)
             
             # 为男性和女性分别拟合GAM模型
             age_range_male, pred_median_male, pred_lower_male, pred_upper_male = fit_gam_model(gam_data, 'male')
             age_range_female, pred_median_female, pred_lower_female, pred_upper_female = fit_gam_model(gam_data, 'female')
+
+            # 稀疏年龄（如 85 岁以上只有几十例）会把样条外推成明显上扬的假趋势，
+            # 只在「该性别样本量 ≥20 例」的年龄区间内绘制拟合曲线，避免图上出现
+            # 由外推造成的伪拐点。
+            def _dense_span(points, min_n=20):
+                cnt = points['age'].round().value_counts()
+                cnt = cnt[cnt >= min_n]
+                return (int(cnt.index.min()), int(cnt.index.max())) if len(cnt) else None
+
+            span_male = _dense_span(gam_data[gam_data['gender'] == 'male'])
+            span_female = _dense_span(gam_data[gam_data['gender'] == 'female'])
+
+            if age_range_male is not None and span_male is not None:
+                keep = (age_range_male >= span_male[0]) & (age_range_male <= span_male[1])
+                age_range_male, pred_median_male = age_range_male[keep], pred_median_male[keep]
+                pred_lower_male, pred_upper_male = pred_lower_male[keep], pred_upper_male[keep]
+
+            if age_range_female is not None and span_female is not None:
+                keep = (age_range_female >= span_female[0]) & (age_range_female <= span_female[1])
+                age_range_female, pred_median_female = age_range_female[keep], pred_median_female[keep]
+                pred_lower_female, pred_upper_female = pred_lower_female[keep], pred_upper_female[keep]
             
-            # 绘制男性GAM曲线
+            # 绘制男性样条分位数回归曲线
+            # 注意：这里拟合的是 quantreg + B 样条基（bs(age, df=4)）的分位数回归，
+            # 不是 GAM；阴影带是 2.5th–97.5th 分位数带（即参考区间随年龄的变化），
+            # 不是"中位数估计的 95% 置信区间"。图和正文都必须按此表述，否则方法学写错。
             if age_range_male is not None:
                 plt.plot(age_range_male, pred_median_male, color='darkblue', linewidth=2.5, label='Male median')
                 plt.fill_between(age_range_male, pred_lower_male, pred_upper_male, 
-                                color='blue', alpha=0.2, label='Male 95% CI')
+                                color='blue', alpha=0.2, label='Male 2.5th–97.5th pct')
             
-            # 绘制女性GAM曲线
+            # 绘制女性样条分位数回归曲线
             if age_range_female is not None:
                 plt.plot(age_range_female, pred_median_female, color='darkred', linewidth=2.5, label='Female median')
                 plt.fill_between(age_range_female, pred_lower_female, pred_upper_female, 
-                                color='red', alpha=0.2, label='Female 95% CI')
+                                color='red', alpha=0.2, label='Female 2.5th–97.5th pct')
             
             # 设置子图属性
             plt.xlabel('Age', fontsize=11, fontweight='bold')
             plt.ylabel('Result', fontsize=11, fontweight='bold')
             plt.title(f"{project['project_name']}", fontsize=12, fontweight='bold', pad=10)
-            plt.legend(loc='upper right', fontsize=8, frameon=True, fancybox=True, shadow=True)
+            plt.legend(loc='upper right', fontsize=8, frameon=True, fancybox=False, shadow=False, framealpha=0.9, edgecolor='0.8')
             
-            # 在图表上方中央添加样本量信息
-            sample_text = f"Total: {total_count}\nMale: {male_count}\nFemale: {female_count}"
-            plt.text(0.5, 0.95, sample_text, transform=ax.transAxes, 
-                     fontsize=10, fontweight='bold', verticalalignment='top', horizontalalignment='center',
+            # 样本量信息放左下角：原来放在顶部中央会被右上角图例压住，数字还被截断
+            sample_text = f"n = {total_count:,}  (M {male_count:,} / F {female_count:,})"
+            plt.text(0.02, 0.03, sample_text, transform=ax.transAxes,
+                     fontsize=8, fontweight='bold', verticalalignment='bottom', horizontalalignment='left',
                      bbox=dict(boxstyle='round', facecolor='white', alpha=0.9, edgecolor='black'))
             
             # 设置y轴范围
@@ -924,11 +1038,13 @@ def main():
                 y_max = gam_data['result'].quantile(0.99)
                 plt.ylim(y_min, y_max)
         
-        plt.suptitle('Generalized Additive Models of Results by Age and Gender', 
+        plt.suptitle('Spline quantile regression of results by age and gender (50th, 2.5th/97.5th percentiles)', 
                      fontsize=16, fontweight='bold', y=0.98)
         plt.tight_layout(rect=[0, 0, 1, 0.95])
-        plt.savefig(os.path.join(output_base_path, "Combined_AFP_GAM_plot.png"), 
-                    dpi=600, bbox_inches='tight', facecolor='white', edgecolor='none')
+        # 图幅本身已是 10 英寸见方，再乘 600 dpi 会得到约 5900×5900 像素的超大 PNG（无法预览），
+        # 统一按 300 dpi 出图，兼顾印刷精度与文件可用性。
+        plt.savefig(os.path.join(output_base_path, "Combined_AFP_GAM_plot.png"),
+                    dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
         # plt.show()
     
     # =========================================================================
@@ -946,7 +1062,10 @@ def main():
         
         # 处理男性数据
         if len(project['male_data']) > 0:
-            male_groups = auto_age_grouping_improved(project['data'][project['data']['gender'] == 'male'])
+            male_groups = auto_age_grouping_improved(
+                project['data'][project['data']['gender'] == 'male'],
+                min_samples=CONFIG["min_samples"],
+                cohen_d_threshold=CONFIG["cohen_d_threshold"])
             
             for i, (low, high) in enumerate(male_groups):
                 group_data = project['data'][
@@ -980,7 +1099,10 @@ def main():
         
         # 处理女性数据
         if len(project['female_data']) > 0:
-            female_groups = auto_age_grouping_improved(project['data'][project['data']['gender'] == 'female'])
+            female_groups = auto_age_grouping_improved(
+                project['data'][project['data']['gender'] == 'female'],
+                min_samples=CONFIG["min_samples"],
+                cohen_d_threshold=CONFIG["cohen_d_threshold"])
             
             for i, (low, high) in enumerate(female_groups):
                 group_data = project['data'][
@@ -1033,15 +1155,16 @@ def main():
         print("年龄分组结果为空，跳过参考区间计算")
     else:
         reference_intervals = []
+        train_file_map = build_project_file_map(train_path)
         
         # 对每个项目、每个性别、每个年龄分组进行处理
         for (project_name, gender), group_data in age_results_df.groupby(['Project', 'Gender']):
             print(f"处理项目: {project_name}, 性别: {gender}")
             
-            # 找到对应的训练数据文件
-            train_file_path = os.path.join(train_path, f"{project_name}.xlsx")
-            if not os.path.exists(train_file_path):
-                print(f"  训练文件不存在: {train_file_path}")
+            # 找到对应的训练数据文件（按目录实际文件名匹配，避免文件名带点号时路径拼错）
+            train_file_path = train_file_map.get(project_name)
+            if train_file_path is None or not os.path.exists(train_file_path):
+                print(f"  训练文件不存在: {project_name}")
                 continue
             
             # 加载训练数据
@@ -1077,8 +1200,8 @@ def main():
                     (gender_df['age'] <= high)
                 ]['result'].values
                 
-                if len(group_result_data) < 20:
-                    print(f"  年龄组 {age_group}: 样本量不足 ({len(group_result_data)} < 20)")
+                if len(group_result_data) < CONFIG["min_group_for_ri"]:
+                    print(f"  年龄组 {age_group}: 样本量不足 ({len(group_result_data)} < {CONFIG['min_group_for_ri']})")
                     continue
                     
                 print(f"  处理 {gender} 组 {age_group}: {len(group_result_data)} 个样本")
@@ -1105,20 +1228,49 @@ def main():
                         outliers = method_func(transformed_data)
                         clean_data = transformed_data[~outliers]
                         
-                        # 使用自举法计算参考区间
-                        lower_bound, upper_bound = bootstrap_reference_interval(clean_data)
-                        
+                        # 使用自举法计算参考区间（含限值的 95% 抽样区间）
+                        (lower_bound, upper_bound,
+                         lower_ci_lo, lower_ci_hi,
+                         upper_ci_lo, upper_ci_hi) = bootstrap_reference_interval(
+                            clean_data,
+                            n_bootstrap=CONFIG["bootstrap_iterations"],
+                            seed=CONFIG["random_seed"])
+
                         # 逆变换回原始尺度
                         original_lower = inverse_boxcox(lower_bound, lmbda, shift)
                         original_upper = inverse_boxcox(upper_bound, lmbda, shift)
-                        
+
+                        # 限值置信区间同样逆变换；数值失败时退回点估计，保证不出现 nan
+                        def _inv_safe(x, fallback):
+                            try:
+                                v = inverse_boxcox(x, lmbda, shift)
+                                return float(v) if np.isfinite(v) else fallback
+                            except Exception:
+                                return fallback
+
+                        original_lower_ci_lo = _inv_safe(lower_ci_lo, original_lower)
+                        original_lower_ci_hi = _inv_safe(lower_ci_hi, original_lower)
+                        original_upper_ci_lo = _inv_safe(upper_ci_lo, original_upper)
+                        original_upper_ci_hi = _inv_safe(upper_ci_hi, original_upper)
+
+                        # 保序：CI 端点不得越过点估计（个别病态分布下会出现交叉）
+                        lo_ci = (min(original_lower_ci_lo, original_lower),
+                                 max(original_lower_ci_hi, original_lower))
+                        hi_ci = (min(original_upper_ci_lo, original_upper),
+                                 max(original_upper_ci_hi, original_upper))
+
                         reference_intervals.append({
                             'Project': project_name,
                             'Gender': gender,
                             'Age Group': age_group,
                             'Method': method_name,
                             'Lower Limit': original_lower,
-                            'Upper Limit': original_upper
+                            'Lower 95% CI Low': lo_ci[0],
+                            'Lower 95% CI High': lo_ci[1],
+                            'Upper Limit': original_upper,
+                            'Upper 95% CI Low': hi_ci[0],
+                            'Upper 95% CI High': hi_ci[1],
+                            'N': len(clean_data)
                         })
                     except Exception as e:
                         print(f"  方法 {method_name} 失败: {e}")
@@ -1209,13 +1361,21 @@ def main():
             
             # 为每个项目计算百分比
             percentages = []
+            val_cache = {}                      # 同一验证集文件只读一次
+            val_file_map = build_project_file_map(val_path)
             
             for idx, row in ref_df.iterrows():
                 if idx % 50 == 0:
                     print(f"处理第 {idx+1}/{len(ref_df)} 行...")
                 
-                percentage = calculate_percentage_for_row(row, val_path)
+                percentage = calculate_percentage_for_row(
+                    row, val_path, cache=val_cache, file_map=val_file_map)
                 percentages.append(percentage)
+            
+            # 添加百分比列到参考区间表
+            ref_df['Percentage'] = percentages
+            # 90% 覆盖率是 CLSI C28-A3c / WS/T 402 的通行验收线，单独标注便于筛查不达标组
+            ref_df['Coverage_OK_90'] = [None if p is None else (p >= 90) for p in percentages]
             
             # 添加百分比列到参考区间表
             ref_df['Percentage'] = percentages
@@ -1235,6 +1395,13 @@ def main():
             if valid_percentages:
                 print(f"百分比范围: {min(valid_percentages)}% - {max(valid_percentages)}%")
                 print(f"平均百分比: {np.mean(valid_percentages):.2f}%")
+                below = [p for p in valid_percentages if p < 90]
+                print(f"覆盖率 <90% 的行数: {len(below)}/{len(valid_percentages)}")
+                if below:
+                    fail_df = ref_df[ref_df['Percentage'].apply(lambda v: v is not None and v < 90)]
+                    for _, r in fail_df.iterrows():
+                        print(f"  未达标: {r['Project']} {r['Gender']} {r['Age Group']} "
+                              f"{r['Method']} -> {r['Percentage']}%")
             
         except Exception as e:
             print(f"内部验证失败: {str(e)}")
@@ -1295,21 +1462,33 @@ def main():
                     current_pos += 1
             
             # 创建森林图
+            # 图幅按标签数量与面板数量自适应：原实现 figsize=(6*5, 15) + 600 dpi 会输出
+            # 17760×8586 像素的 PNG，既无法预览也无法用于投稿。这里限制单边像素 ≤5800，
+            # 并按行高缩放字号，避免标签互相压字。
+            n_rows = max(1, len(y_labels))
+            fig_w = 2.8 * len(methods) + 2.2
+            # 行高加大：0.42 英寸/行，让各组人群纵向拉开、标签不挤
+            fig_h = max(5.5, 0.42 * n_rows + 2.4)
+            save_dpi = 300
+            while max(fig_w, fig_h) * save_dpi > 5800:
+                save_dpi -= 25
+            font_size = int(max(9, min(15, (fig_h * 72.0 / (n_rows + 2)) * 0.62)))
+
             plt.rcParams['font.sans-serif'] = ['Arial']
             plt.rcParams['axes.unicode_minus'] = False
-            plt.rcParams['figure.dpi'] = 600
-            plt.rcParams['font.size'] = 20
-            plt.rcParams['axes.linewidth'] = 1.5
-            plt.rcParams['xtick.major.width'] = 1.5
-            plt.rcParams['ytick.major.width'] = 1.5
+            plt.rcParams['figure.dpi'] = save_dpi
+            plt.rcParams['font.size'] = font_size
+            plt.rcParams['axes.linewidth'] = 1.0
+            plt.rcParams['xtick.major.width'] = 1.0
+            plt.rcParams['ytick.major.width'] = 1.0
             plt.rcParams['font.weight'] = 'bold'
-            
-            fig, axes = plt.subplots(1, len(methods), figsize=(6*len(methods), 15), sharey=True)
+
+            fig, axes = plt.subplots(1, len(methods), figsize=(fig_w, fig_h), sharey=True)
             if len(methods) == 1:
                 axes = [axes]
-            
-            fig.suptitle('Validation sets for RIs established by different algorithms', 
-                         fontsize=24, y=0.95, fontweight='bold')
+
+            fig.suptitle('Validation sets for RIs established by different algorithms',
+                         fontsize=font_size + 6, y=0.99, fontweight='bold')
             
             # 为每个方法创建子图
             for method_idx, method in enumerate(methods):
@@ -1369,13 +1548,16 @@ def main():
                 # 设置Y轴
                 ax.set_yticks(range(len(y_labels)))
                 reversed_labels = y_labels[::-1]
-                ax.set_yticklabels(reversed_labels, fontsize=23, fontweight='bold')
+                ax.set_yticklabels(reversed_labels, fontsize=font_size + 2, fontweight='bold')
                 
-                # 设置X轴
+                # X 轴固定 85–100%（用户要求；本队列最低覆盖率 89.76%，无点被裁）
                 ax.set_xlim(85, 100)
-                ax.set_xlabel('Validation Percentage (%)', fontsize=20, fontweight='bold')
+                # X 轴标题只在中间面板给一次，五份重复文字会互相压字
+                if method_idx == len(methods) // 2:
+                    ax.set_xlabel('Validation percentage (%)',
+                                  fontsize=font_size + 2, fontweight='bold', labelpad=8)
                 ax.grid(axis='x', alpha=0.4, linestyle=':', linewidth=0.8)
-                ax.set_title(f'{method}', fontsize=23, pad=25, fontweight='bold')
+                ax.set_title(method.replace(' ', '\n'), fontsize=font_size + 3, pad=8, fontweight='bold')
                 
                 # 添加项目分隔线
                 for i in range(len(projects) - 1):
@@ -1389,32 +1571,35 @@ def main():
                         actual_pos = len(y_labels) - 1 - i
                         ax.axhspan(actual_pos - 0.5, actual_pos + 0.5, facecolor='lightgray', alpha=0.2)
                 
-                # 在90%位置添加红色垂直虚线
+                # 在90%位置添加红色垂直虚线（标签放顶部，避免压在某一行的数据点上）
                 ax.axvline(x=90, color='red', linestyle='-.', linewidth=2.5, alpha=0.9)
-                ax.text(90.2, 2, '90%', fontsize=27, fontweight='bold', color='red')
+                ax.text(90.4, len(y_labels) - 0.6, '90%', fontsize=font_size + 3, fontweight='bold',
+                        color='red', verticalalignment='center')
                 
                 # 设置纵坐标字体
-                ax.tick_params(axis='y', which='major', labelsize=20)
+                ax.tick_params(axis='y', which='major', labelsize=font_size)
                 for label in ax.get_yticklabels():
                     label.set_fontweight('bold')
-            
+
+            marker_size = max(6, font_size * 0.8)
             # 添加图例
-            legend_elements = [plt.Line2D([0], [0], marker='o', color='w', 
-                                         markerfacecolor='darkblue', markersize=15, 
+            legend_elements = [plt.Line2D([0], [0], marker='o', color='w',
+                                         markerfacecolor='darkblue', markersize=marker_size,
                                          label='Male', markeredgecolor='black', markeredgewidth=1.2),
-                              plt.Line2D([0], [0], marker='o', color='w', 
-                                         markerfacecolor='darkred', markersize=15, 
+                              plt.Line2D([0], [0], marker='o', color='w',
+                                         markerfacecolor='darkred', markersize=marker_size,
                                          label='Female', markeredgecolor='black', markeredgewidth=1.2)]
-            fig.legend(handles=legend_elements, title='Gender', 
-                      loc='upper right', fontsize=20, title_fontsize=25,
-                      bbox_to_anchor=(0.99, 0.97), frameon=True, fancybox=True, shadow=True)
-            
+            fig.legend(handles=legend_elements, title='Gender',
+                      loc='upper center', ncol=2, fontsize=font_size + 2,
+                      title_fontsize=font_size + 3,
+                      bbox_to_anchor=(0.5, 0.945), frameon=False)
+
             # 调整布局
-            plt.tight_layout(rect=[0, 0, 1, 0.93])
-            
+            plt.tight_layout(rect=[0, 0, 1, 0.90])
+
             # 保存图片
             sci_quality_plot_path = os.path.join(output_base_path, 'SCI_quality_combined_methods_reference_interval_forest_plot.png')
-            plt.savefig(sci_quality_plot_path, dpi=600, bbox_inches='tight')
+            plt.savefig(sci_quality_plot_path, dpi=save_dpi, bbox_inches='tight')
             print(f"SCI期刊质量的合并方法参考区间森林图已保存到: {sci_quality_plot_path}")
             
             # plt.show()
@@ -1435,4 +1620,33 @@ def main():
     print("8. SCI_quality_combined_methods_reference_interval_forest_plot.png")
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="间接法参考区间构建与验证（RWD，五法剔除异常值 + Harris-Boyd + 年龄分组 + bootstrap）")
+    parser.add_argument("--input", default=".", help="原始 xlsx 数据所在目录（默认当前目录）")
+    parser.add_argument("--output", default=None, help="结果输出目录（默认 ./results_<时间戳>）")
+    parser.add_argument("--train-ratio", type=float, default=None, help="训练集比例，默认 0.8（按测定时间顺序切分）")
+    parser.add_argument("--min-samples", type=int, default=None, help="年龄分组最小样本量，默认 120")
+    parser.add_argument("--cohen-d", type=float, default=None, help="年龄分组 Cohen's d 合并阈值，默认 0.2")
+    parser.add_argument("--bootstrap", type=int, default=None, help="bootstrap 次数，默认 1000")
+    parser.add_argument("--min-group", type=int, default=None, help="计算参考区间的最低样本量，默认 20")
+    parser.add_argument("--seed", type=int, default=None, help="随机种子，默认 42")
+    parser.add_argument("--result-lower-bound", type=float, default=None,
+                        help="结果值下限；默认剔除 <=0（若指标可取 0 或负值，请显式指定）")
+    args = parser.parse_args()
+
+    configure(
+        input_dir=args.input,
+        output_dir=args.output,
+        train_ratio=args.train_ratio,
+        min_samples=args.min_samples,
+        cohen_d_threshold=args.cohen_d,
+        bootstrap_iterations=args.bootstrap,
+        min_group_for_ri=args.min_group,
+        random_seed=args.seed,
+    )
+    if args.result_lower_bound is not None:
+        CONFIG["result_lower_bound"] = args.result_lower_bound
+
     main()
